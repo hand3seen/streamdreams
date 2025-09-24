@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Headmosh — Triangle Storm (Chill + Mini-Game)</title>
+  <meta name="description" content="Chill audio-reactive triangles with a simple Firefly mini-game and neon HUD.">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <style>
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    /* Controls */
+    #ui{position:fixed;left:16px;top:16px;z-index:10;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .btn, select, input[type=range]{
+      padding:10px 12px;border:1px solid rgba(255,255,255,.25);border-radius:12px;
+      background:rgba(0,0,0,.45);backdrop-filter:blur(6px);color:#fff;cursor:pointer;font-weight:600
+    }
+    .btn:hover, select:hover{border-color:rgba(255,255,255,.55)}
+    .pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);opacity:.9;font-size:12px}
+    label{font-size:12px;opacity:.85;margin-left:6px;margin-right:4px}
+    input[type=range]{width:160px}
+
+    #help{position:fixed;right:16px;top:16px;z-index:10;background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.15);
+      border-radius:12px;padding:10px 12px;max-width:420px;line-height:1.35}
+
+    #saveToast{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:10;display:none;
+      color:#fff;background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.2);border-radius:10px;padding:8px 12px}
+
+    canvas{display:block}
+
+    /* Neon badge + meter */
+    .pump-link{
+      position:fixed;left:18px;top:18px;z-index:11;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);
+      border:1px solid rgba(255,255,255,.15);border-radius:12px;color:#e8f3ff;text-decoration:none;
+      padding:10px 14px;font-size:14px;line-height:1;display:flex;gap:10px;align-items:center
+    }
+    .pump-dot{width:8px;height:8px;border-radius:50%;background:rgb(60,200,255);box-shadow:0 0 12px 4px rgba(60,200,255,.7)}
+    #mic-hint{position:fixed;right:18px;top:18px;color:#cde;z-index:11;font-size:12px;background:rgba(0,0,0,.5);
+      padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12)}
+    #meter{position:fixed;left:18px;bottom:18px;width:240px;height:10px;background:#111;border:1px solid #333;border-radius:999px;overflow:hidden;z-index:11}
+    #meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#27ffbe,#4ca5ff)}
+  </style>
+</head>
+<body>
+  <!-- Neon link badge -->
+  <a id="coinUrl" class="pump-link" target="_blank" rel="noreferrer">
+    <span class="pump-dot"></span>
+    <span id="coinText">pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump</span>
+  </a>
+  <div id="mic-hint">Hotkeys: <b>M</b> audio • <b>C</b> chill • <b>G</b> game • <b>K/J</b> sens • <b>N</b> palette • <b>B</b> bloom</div>
+  <div id="meter"><i></i></div>
+
+  <!-- Controls -->
+  <div id="ui">
+    <select id="micSelect" title="Choose microphone"></select>
+    <button id="audioBtn" class="btn">Enable Audio</button>
+    <label for="sens">Sensitivity</label><input id="sens" type="range" min="1" max="20" value="8" />
+    <button id="chillBtn" class="btn">Chill: OFF</button>
+    <button id="gameBtn" class="btn">Start Game</button>
+    <span id="ampLevel" class="pill">level: 0.00</span>
+    <span id="status" class="pill">idle</span>
+    <button id="stormBtn" class="btn">Tip $MOSH (demo)</button>
+    <button id="saveBtn" class="btn">Mint This Moment (PNG)</button>
+  </div>
+
+  <div id="help">
+    <strong>Headmosh — Triangle Storm</strong><br/>
+    Pick a mic → <em>Enable Audio</em>. <b>C</b>=Chill mode, <b>G</b>=Firefly mini-game (WASD/Arrows), <b>N</b>=Neon, <b>B</b>=Bloom. Draw to ink; audio gently moves the world.
+  </div>
+  <div id="saveToast">Saved!</div>
+
+  <script>
+    /* ==================== AUDIO (native WebAudio) ==================== */
+    let audioCtx, analyser, data, freqData, currentStream = null, audioOn = false;
+
+    async function listMics() {
+      try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e) {}
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices.filter(d => d.kind === 'audioinput');
+      const sel = document.getElementById('micSelect');
+      sel.innerHTML = '';
+      mics.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId || '';
+        opt.textContent = d.label || `Microphone ${i+1}`;
+        sel.appendChild(opt);
+      });
+      if (!mics.length) document.getElementById('status').textContent = 'no mics found';
+    }
+
+    async function startAudio() {
+      const status = document.getElementById('status');
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+        if (audioCtx.state !== 'running') await audioCtx.resume();
+        stopAudio(); // stop old stream if any
+        const deviceId = document.getElementById('micSelect').value;
+        const constraints = {
+          audio: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            echoCancellation: false, noiseSuppression: false, autoGainControl: false
+          }
+        };
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        const source = audioCtx.createMediaStreamSource(currentStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048;
+        data = new Uint8Array(analyser.fftSize);
+        freqData = new Uint8Array(analyser.frequencyBinCount);
+        source.connect(analyser);
+        audioOn = true;
+        status.textContent = 'mic: running';
+        document.getElementById('mic-hint').style.display = 'none';
+      } catch (e) {
+        document.getElementById('status').textContent = 'mic error';
+        alert('Microphone error: ' + e.message + '\nCheck Chrome site permission + Windows microphone privacy.');
+        console.error(e);
+      }
+    }
+    function stopAudio(){
+      if (currentStream){ currentStream.getTracks().forEach(t=>t.stop()); currentStream = null; }
+      audioOn = false;
+      document.getElementById('status').textContent = 'idle';
+      document.getElementById('mic-hint').style.display = 'block';
+    }
+    function toggleAudio(){ audioOn ? stopAudio() : startAudio(); }
+
+    function getLevel() { // RMS time-domain
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
+      return Math.sqrt(sum / data.length);
+    }
+    function getBassEnergy() { // simple low-band
+      if (!analyser || !freqData || !audioCtx) return 0;
+      analyser.getByteFrequencyData(freqData);
+      const binHz = (audioCtx.sampleRate/2) / freqData.length;
+      const lowLimitHz = 180;
+      const lowBins = Math.max(1, Math.floor(lowLimitHz/binHz));
+      let sum=0; for (let i=0;i<lowBins && i<freqData.length;i++) sum += freqData[i];
+      return (sum / lowBins) / 255; // 0..1
+    }
+
+    /* ==================== VISUALS (p5) ==================== */
+    let triangles = [], pg, stormBurst = 0, lastLevel = 0;
+    let isDrawing = false, lastPx = null, lastPy = null;
+
+    // clap/bass detector
+    let lastPeakLevel = 0;
+    const PEAK = 0.06;
+
+    // neon & bloom options
+    let paletteIndex = 0;   // 0 = monochrome
+    let bloom = false;
+    const palettes = [
+      [[255,255,255]],
+      [[10,240,255],[180,90,255],[255,80,180],[255,210,60]],
+      [[90,200,255],[90,255,160],[255,120,120],[250,250,180]],
+      [[255,100,40],[255,220,40],[80,220,255],[120,120,255]],
+      [[140,255,220],[255,80,140],[110,150,255],[255,220,160]],
+    ];
+
+    // Chill mode
+    let CHILL = false;
+
+    // --- Mini-game: Firefly Collect ---
+    let gameOn = false, score = 0, timeLeft = 0, gameTimerId = null;
+    const player = { x: 0, y: 0, vx:0, vy:0, r:12, accel:0.5, fric:0.88, max:4.2 };
+    const keys = {};
+    const fireflies = []; // {x,y,r,vx,vy}
+
+    class Tri {
+      constructor(){
+        this.reset(true);
+        this.ci = Math.floor(random(palettes[paletteIndex].length));
+      }
+      reset(randPos=false){
+        this.x = randPos ? random(width) : (random()<.5? -40 : width+40);
+        this.y = random(height);
+        this.vx = random(-0.4,0.4);
+        this.vy = random(-0.15,0.15);
+        this.size = random(12,32);
+        this.r = random(TWO_PI);
+        this.spin = random(-0.008,0.008);
+        this.life = random(600,1400);
+      }
+      step(energy){
+        const motionScale = CHILL ? 0.12 : 0.18;
+        this.x += this.vx + (noise(this.y*0.003, frameCount*0.002)-0.5)*0.5;
+        this.y += this.vy + (noise(this.x*0.003, frameCount*0.002)-0.5)*0.35;
+        this.r += this.spin;
+        this.life--;
+        this.vx *= (1 + energy*motionScale);
+        this.vy *= (1 + energy*motionScale);
+        this.spin += energy*0.01;
+        this.size += energy*(CHILL?0.4:0.7) + stormBurst*0.3;
+        this.size = constrain(this.size, 8, 80);
+        if(this.life<=0 || this.x<-80 || this.x>width+80 || this.y<-80 || this.y>height+80) this.reset();
+      }
+      draw(g){
+        g.push(); g.translate(this.x,this.y); g.rotate(this.r);
+        const cols = palettes[paletteIndex];
+        const c = cols[this.ci % cols.length];
+        g.noFill();
+        g.stroke(c[0], c[1], c[2], CHILL ? 180 : 255);
+        g.strokeWeight(1.2 + (bloom ? 0.8 : 0) + stormBurst*0.6);
+        const s=this.size; g.triangle(0,-s,-s*0.9,s*0.7,s*0.9,s*0.7);
+        g.pop();
+      }
+    }
+
+    function setup(){
+      createCanvas(windowWidth, windowHeight);
+      // Transparent ink
+      pg = createGraphics(windowWidth, windowHeight);
+      pg.clear(); pg.stroke(240); pg.strokeWeight(2); pg.noFill();
+
+      // FEWER base triangles by default (chill)
+      for(let i=0;i<48;i++) triangles.push(new Tri());
+
+      // Buttons
+      document.getElementById('audioBtn').onclick = startAudio;
+      document.getElementById('stormBtn').onclick = ()=>{
+        if (CHILL) return; // no manual storm in chill
+        stormBurst = 1.4; setTimeout(()=>stormBurst=0,300);
+        for(let i=0;i<6;i++){ const t=new Tri(); t.x=random(width*.35,width*.65); t.y=random(height*.35,height*.65);
+          t.vx=random(-1.6,1.6); t.vy=random(-1.2,1.2); t.size=random(14,28); triangles.push(t); }
+      };
+      document.getElementById('saveBtn').onclick = saveMoment;
+      document.getElementById('chillBtn').onclick = toggleChill;
+      document.getElementById('gameBtn').onclick = toggleGame;
+
+      // Drawing
+      window.addEventListener('pointerdown', e=>{ if(!gameOn){ isDrawing=true; lastPx=lastPy=null; drawPoint(e,true); } });
+      window.addEventListener('pointermove', e=>{ if(!gameOn && isDrawing) drawPoint(e,false); });
+      window.addEventListener('pointerup',   ()=>{ isDrawing=false; lastPx=lastPy=null; });
+      window.addEventListener('pointercancel',()=>{ isDrawing=false; lastPx=lastPy=null; });
+
+      // Hotkeys
+      window.addEventListener('keydown', (ev)=>{
+        if (ev.key==='m'||ev.key==='M') toggleAudio();
+        if (ev.key==='b'||ev.key==='B') bloom = !bloom;
+        if (ev.key==='n'||ev.key==='N') paletteIndex=(paletteIndex+1)%palettes.length;
+        if (ev.key==='c'||ev.key==='C') toggleChill();
+        if (ev.key==='g'||ev.key==='G') toggleGame();
+        // game controls
+        keys[ev.key] = true;
+      });
+      window.addEventListener('keyup', (ev)=>{ keys[ev.key] = false; });
+
+      // Link badge
+      const coinURL = "https://pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump";
+      document.getElementById('coinText').textContent = coinURL.replace(/^https?:\/\//,'');
+      document.getElementById('coinUrl').href = coinURL;
+
+      listMics();
+      navigator.mediaDevices?.addEventListener?.('devicechange', listMics);
+
+      // init game player
+      player.x = width*0.5; player.y = height*0.75;
+    }
+
+    function windowResized(){
+      resizeCanvas(windowWidth, windowHeight);
+      const old=pg; pg=createGraphics(windowWidth, windowHeight);
+      pg.clear(); pg.image(old,0,0); pg.stroke(240); pg.strokeWeight(2); pg.noFill();
+      old.remove();
+    }
+
+    function drawPoint(e, first){
+      const rect = document.querySelector('canvas').getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      if (lastPx==null || first) pg.point(x,y); else pg.line(lastPx,lastPy,x,y);
+      // spawn fewer triangles along stroke
+      if (!CHILL) {
+        const t = new Tri(); t.x=x+random(-6,6); t.y=y+random(-6,6);
+        t.vx=random(-0.8,0.8); t.vy=random(-0.6,0.6); t.size=random(12,22);
+        triangles.push(t);
+      }
+      lastPx = x; lastPy = y;
+    }
+
+    function draw(){
+      background(10);
+
+      // Audio → energy
+      const sens = Number(document.getElementById('sens').value);
+      const raw  = getLevel();
+      const lvl  = lerp(lastLevel, raw, 0.5); lastLevel = lvl;
+      const bass = getBassEnergy();
+      let energy = Math.min(1.0, lvl * sens * (CHILL?2.2:4.0));
+      if (!CHILL && bass > 0.35) energy = Math.min(1.2, energy + (bass-0.35)*0.6);
+
+      document.getElementById('ampLevel').textContent = `level: ${lvl.toFixed(2)}`;
+      const meter = document.querySelector('#meter > i');
+      if (meter){ meter.style.width = Math.min(100, Math.round(energy*100)) + '%'; }
+
+      // Clap/bass trigger (disabled in CHILL)
+      if (!CHILL && ((lvl > PEAK && lastPeakLevel <= PEAK) || bass > 0.55)) {
+        stormBurst = 1.2; setTimeout(() => stormBurst = 0, 220);
+        for (let i = 0; i < 5; i++) {
+          const t = new Tri();
+          t.x = random(width * 0.35, width * 0.65);
+          t.y = random(height * 0.35, height * 0.65);
+          t.vx = random(-1.6, 1.6);
+          t.vy = random(-1.2, 1.2);
+          t.size = random(12, 26);
+          triangles.push(t);
+        }
+      }
+      lastPeakLevel = lvl;
+
+      // World + ink
+      drawWorld(this, energy);
+      image(pg,0,0);
+
+      // Bloom-ish pop
+      if (bloom){
+        push(); drawingContext.globalCompositeOperation = 'screen'; image(pg, 0, 0); pop();
+      }
+
+      // Game overlay
+      if (gameOn) drawGame(energy);
+
+      // Vignette (softer in chill)
+      noFill(); stroke(255, CHILL?14:18); strokeWeight(80);
+      rect(width*.5,height*.5,width*.96,height*.96,30);
+    }
+
+    function drawWorld(g, energy){
+      // soft clouds; dimmer in chill
+      g.push();
+      for(let i=0;i<5;i++){
+        const y=(sin((frameCount*0.002+i)*1.3)*0.5+0.5)*height;
+        const base = CHILL?6:8;
+        g.noStroke(); g.fill(255, base + Math.min(40, energy*(CHILL?30:50)));
+        g.ellipse((i/5)*width*1.1, y, width*0.9, 200);
+      }
+      g.pop();
+      // triangles
+      for(const t of triangles){ t.step(energy); t.draw(g); }
+      // tiny platform glow
+      g.push(); g.noStroke(); g.fill(255, CHILL?10:14); g.ellipse(width/2,height*.82,360,60); g.fill(255); g.ellipse(width/2,height*.82-8,6,6); g.pop();
+    }
+
+    /* ==================== MINI-GAME ==================== */
+    function toggleGame(){
+      if (gameOn) endGame();
+      else startGame();
+    }
+    function startGame(){
+      gameOn = true; score = 0; timeLeft = 60;
+      player.x = width*0.5; player.y = height*0.75; player.vx=0; player.vy=0;
+      fireflies.length = 0;
+      for (let i=0;i<6;i++) spawnFirefly();
+      clearInterval(gameTimerId);
+      gameTimerId = setInterval(()=>{ timeLeft--; if (timeLeft<=0) endGame(); }, 1000);
+      document.getElementById('gameBtn').textContent = 'End Game';
+    }
+    function endGame(){
+      gameOn = false;
+      clearInterval(gameTimerId);
+      document.getElementById('gameBtn').textContent = 'Start Game';
+    }
+    function spawnFirefly(){
+      const f = {
+        x: random(width*0.15, width*0.85),
+        y: random(height*0.2, height*0.8),
+        r: random(8,12),
+        vx: random(-0.4,0.4),
+        vy: random(-0.3,0.3),
+        a: random(120,200)
+      };
+      fireflies.push(f);
+    }
+    function drawGame(energy){
+      // controls
+      const left = keys['ArrowLeft']||keys['a']||keys['A'];
+      const right= keys['ArrowRight']||keys['d']||keys['D'];
+      const up   = keys['ArrowUp']||keys['w']||keys['W'];
+      const down = keys['ArrowDown']||keys['s']||keys['S'];
+      if (left) player.vx -= player.accel;
+      if (right)player.vx += player.accel;
+      if (up)   player.vy -= player.accel;
+      if (down) player.vy += player.accel;
+      player.vx *= player.fric; player.vy *= player.fric;
+      const sp = Math.hypot(player.vx, player.vy);
+      if (sp > player.max){ player.vx = player.vx/sp*player.max; player.vy = player.vy/sp*player.max; }
+      player.x += player.vx; player.y += player.vy;
+      player.x = constrain(player.x, 10, width-10); player.y = constrain(player.y, 10, height-10);
+
+      // fireflies drift; gentle push from audio
+      for (const f of fireflies){
+        f.vx += (noise(f.y*0.004, frameCount*0.002)-0.5)*0.08 + (energy-0.2)*0.02;
+        f.vy += (noise(f.x*0.004, frameCount*0.002)-0.5)*0.06 + (energy-0.2)*0.02;
+        f.vx = constrain(f.vx, -0.8, 0.8);
+        f.vy = constrain(f.vy, -0.8, 0.8);
+        f.x += f.vx; f.y += f.vy;
+        if (f.x < 8) f.x=8; if (f.x>width-8) f.x=width-8;
+        if (f.y < 8) f.y=8; if (f.y>height-8) f.y=height-8;
+      }
+
+      // collect
+      for (let i=fireflies.length-1;i>=0;i--){
+        const f = fireflies[i];
+        if (dist(player.x,player.y,f.x,f.y) < player.r + f.r){
+          fireflies.splice(i,1);
+          score++;
+          spawnFirefly();
+        }
+      }
+
+      // draw fireflies
+      push();
+      for (const f of fireflies){
+        noStroke();
+        fill(255, 220); circle(f.x, f.y, f.r*2);
+        fill(120, 200, 255, f.a); circle(f.x, f.y, f.r*4);
+      }
+      pop();
+
+      // player
+      push();
+      noFill();
+      stroke(255); strokeWeight(2);
+      circle(player.x, player.y, player.r*2);
+      pop();
+
+      // HUD
+      push();
+      textAlign(CENTER, TOP);
+      textSize(16);
+      noStroke();
+      fill(0,140); rect(width/2-120, 16, 240, 30, 10);
+      fill(230);
+      text(`Fireflies: ${score}   Time: ${timeLeft}s`, width/2, 22);
+      pop();
+
+      if (timeLeft<=0){
+        push();
+        textAlign(CENTER, CENTER);
+        textSize(28); noStroke();
+        fill(0,170); rect(width/2-180, height/2-60, 360, 120, 16);
+        fill(255);
+        text(`Round Over\nScore: ${score}`, width/2, height/2);
+        pop();
+      }
+    }
+
+    /* ==================== MISC ==================== */
+    function toggleChill(){
+      CHILL = !CHILL;
+      document.getElementById('chillBtn').textContent = 'Chill: ' + (CHILL?'ON':'OFF');
+    }
+    function saveMoment(){
+      const merged = createGraphics(width, height);
+      merged.background(20);
+      drawWorld(merged, 0);
+      merged.image(pg,0,0);
+      saveCanvas(merged, 'headmosh_triangle_storm', 'png');
+      merged.remove();
+      const t=document.getElementById('saveToast'); t.style.display='block'; setTimeout(()=>t.style.display='none',1200);
+    }
+  </script>
+</body>
+</html>
