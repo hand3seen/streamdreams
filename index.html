@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Headmosh — Triangle Storm (Neon HUD + Hotkeys)</title>
+  <meta name="description" content="Audio-reactive Headmosh triangles with neon HUD, hotkeys, and transparent ink.">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <style>
+    html,body{height:100%;margin:0;background:#000;color:#fff;font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    /* Original UI */
+    #ui{position:fixed;left:16px;top:16px;z-index:10;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .btn, select, input[type=range]{
+      padding:10px 12px;border:1px solid rgba(255,255,255,.25);border-radius:12px;
+      background:rgba(0,0,0,.45);backdrop-filter:blur(6px);color:#fff;cursor:pointer;font-weight:600
+    }
+    .btn:hover, select:hover{border-color:rgba(255,255,255,.55)}
+    .pill{padding:6px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.18);opacity:.9;font-size:12px}
+
+    #help{position:fixed;right:16px;top:16px;z-index:10;background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.15);
+      border-radius:12px;padding:10px 12px;max-width:380px;line-height:1.35}
+
+    #saveToast{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:10;display:none;
+      color:#fff;background:rgba(0,0,0,.6);border:1px solid rgba(255,255,255,.2);border-radius:10px;padding:8px 12px}
+
+    canvas{display:block}
+    label{font-size:12px;opacity:.85;margin-left:6px;margin-right:4px}
+    input[type=range]{width:160px}
+
+    /* Neon Network bits */
+    .pump-link{
+      position:fixed;left:18px;top:18px;z-index:11;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);
+      border:1px solid rgba(255,255,255,.15);border-radius:12px;color:#e8f3ff;text-decoration:none;
+      padding:10px 14px;font-size:14px;line-height:1;display:flex;gap:10px;align-items:center
+    }
+    .pump-dot{width:8px;height:8px;border-radius:50%;background:rgb(60,200,255);box-shadow:0 0 12px 4px rgba(60,200,255,.7)}
+    #mic-hint{position:fixed;right:18px;top:18px;color:#cde;z-index:11;font-size:12px;background:rgba(0,0,0,.5);
+      padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12)}
+    #meter{position:fixed;left:18px;bottom:18px;width:240px;height:10px;background:#111;border:1px solid #333;border-radius:999px;overflow:hidden;z-index:11}
+    #meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#27ffbe,#4ca5ff)}
+  </style>
+</head>
+<body>
+  <!-- Neon link badge -->
+  <a id="coinUrl" class="pump-link" target="_blank" rel="noreferrer">
+    <span class="pump-dot"></span>
+    <span id="coinText">pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump</span>
+  </a>
+  <div id="mic-hint">Hotkeys: <b>M</b> audio • <b>K/J</b> sens • <b>T</b> turbo • <b>N</b> palette • <b>B</b> bloom</div>
+  <div id="meter"><i></i></div>
+
+  <!-- Original controls -->
+  <div id="ui">
+    <select id="micSelect" title="Choose microphone"></select>
+    <button id="audioBtn" class="btn">Enable Audio</button>
+    <label for="sens">Sensitivity</label><input id="sens" type="range" min="1" max="20" value="8" />
+    <span id="ampLevel" class="pill">level: 0.00</span>
+    <span id="status" class="pill">idle</span>
+    <button id="stormBtn" class="btn">Tip $MOSH (demo)</button>
+    <button id="saveBtn" class="btn">Mint This Moment (PNG)</button>
+  </div>
+
+  <div id="help">
+    <strong>Headmosh — Triangle Storm</strong><br/>
+    Pick a mic → <em>Enable Audio</em>. Drag to draw ink. Press <b>M</b> to toggle audio, <b>N</b> for neon, <b>B</b> for bloom-ish pop.
+  </div>
+  <div id="saveToast">Saved!</div>
+
+  <script>
+    /* ==================== AUDIO (native WebAudio) ==================== */
+    let audioCtx, analyser, data, freqData, currentStream = null, audioOn = false;
+
+    async function listMics() {
+      try { await navigator.mediaDevices.getUserMedia({ audio: true }); } catch(e) {}
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const mics = devices.filter(d => d.kind === 'audioinput');
+      const sel = document.getElementById('micSelect');
+      sel.innerHTML = '';
+      mics.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId || '';
+        opt.textContent = d.label || `Microphone ${i+1}`;
+        sel.appendChild(opt);
+      });
+      if (!mics.length) document.getElementById('status').textContent = 'no mics found';
+    }
+
+    async function startAudio() {
+      const status = document.getElementById('status');
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+        if (audioCtx.state !== 'running') await audioCtx.resume();
+        stopAudio(); // stop old stream if any
+        const deviceId = document.getElementById('micSelect').value;
+        const constraints = {
+          audio: {
+            deviceId: deviceId ? { exact: deviceId } : undefined,
+            echoCancellation: false, noiseSuppression: false, autoGainControl: false
+          }
+        };
+        currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+        const source = audioCtx.createMediaStreamSource(currentStream);
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 2048;
+        data = new Uint8Array(analyser.fftSize);
+        freqData = new Uint8Array(analyser.frequencyBinCount);
+        source.connect(analyser);
+        audioOn = true;
+        status.textContent = 'mic: running';
+        document.getElementById('mic-hint').style.display = 'none';
+      } catch (e) {
+        document.getElementById('status').textContent = 'mic error';
+        alert('Microphone error: ' + e.message + '\nCheck Chrome site permission + Windows microphone privacy.');
+        console.error(e);
+      }
+    }
+    function stopAudio(){
+      if (currentStream){ currentStream.getTracks().forEach(t=>t.stop()); currentStream = null; }
+      audioOn = false;
+      document.getElementById('status').textContent = 'idle';
+      document.getElementById('mic-hint').style.display = 'block';
+    }
+    function toggleAudio(){ audioOn ? stopAudio() : startAudio(); }
+
+    function getLevel() { // RMS time-domain
+      if (!analyser) return 0;
+      analyser.getByteTimeDomainData(data);
+      let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
+      return Math.sqrt(sum / data.length);
+    }
+    function getBassEnergy() { // simple low-band from frequency bins
+      if (!analyser || !freqData) return 0;
+      analyser.getByteFrequencyData(freqData);
+      const binHz = (audioCtx.sampleRate/2) / freqData.length; // Nyquist / bins
+      const lowLimitHz = 180;
+      const lowBins = Math.max(1, Math.floor(lowLimitHz/binHz));
+      let sum=0; for (let i=0;i<lowBins && i<freqData.length;i++) sum += freqData[i];
+      return (sum / lowBins) / 255; // 0..1
+    }
+
+    /* ==================== VISUALS (p5) ==================== */
+    let triangles = [], pg, stormBurst = 0, lastLevel = 0;
+    let isDrawing = false, lastPx = null, lastPy = null;
+
+    // clap/bass detector
+    let lastPeakLevel = 0;
+    const PEAK = 0.06;
+
+    // neon & bloom-ish options
+    let paletteIndex = 0;   // 0 = monochrome
+    let bloom = false;
+    const palettes = [
+      // 0: Monochrome (white)
+      [[255,255,255]],
+      // 1..: neon-ish
+      [[10,240,255],[180,90,255],[255,80,180],[255,210,60]],
+      [[90,200,255],[90,255,160],[255,120,120],[250,250,180]],
+      [[255,100,40],[255,220,40],[80,220,255],[120,120,255]],
+      [[140,255,220],[255,80,140],[110,150,255],[255,220,160]],
+    ];
+
+    class Tri {
+      constructor(){
+        this.reset(true);
+        this.ci = Math.floor(random(palettes[paletteIndex].length)); // color index
+      }
+      reset(randPos=false){
+        this.x = randPos ? random(width) : (random()<.5? -40 : width+40);
+        this.y = random(height);
+        this.vx = random(-0.6,0.6);
+        this.vy = random(-0.2,0.2);
+        this.size = random(12,36); // slightly smaller
+        this.r = random(TWO_PI);
+        this.spin = random(-0.01,0.01);
+        this.life = random(420,1200);
+      }
+      step(energy){
+        this.x += this.vx + (noise(this.y*0.003, frameCount*0.002)-0.5)*0.6;
+        this.y += this.vy + (noise(this.x*0.003, frameCount*0.002)-0.5)*0.4;
+        this.r += this.spin;
+        this.life--;
+        // audio motion & pulse
+        this.vx *= (1 + energy*0.18);
+        this.vy *= (1 + energy*0.18);
+        this.spin += energy*0.015;
+        this.size += energy*0.7 + stormBurst*0.35;
+        this.size = constrain(this.size, 8, 90);
+        if(this.life<=0 || this.x<-80 || this.x>width+80 || this.y<-80 || this.y>height+80) this.reset();
+      }
+      draw(g){
+        g.push(); g.translate(this.x,this.y); g.rotate(this.r);
+        const cols = palettes[paletteIndex];
+        const c = cols[this.ci % cols.length];
+        g.noFill();
+        g.stroke(c[0], c[1], c[2], 255);
+        g.strokeWeight(1.5 + (bloom ? 1.0 : 0) + stormBurst*0.8);
+        const s=this.size; g.triangle(0,-s,-s*0.9,s*0.7,s*0.9,s*0.7);
+        g.pop();
+      }
+    }
+
+    function setup(){
+      createCanvas(windowWidth, windowHeight);
+
+      // Transparent ink (shows world beneath)
+      pg = createGraphics(windowWidth, windowHeight);
+      pg.clear();
+      pg.stroke(240); pg.strokeWeight(2); pg.noFill();
+
+      // FEWER base triangles (scaled back)
+      for(let i=0;i<60;i++) triangles.push(new Tri());
+
+      document.getElementById('audioBtn').onclick = startAudio;
+      document.getElementById('stormBtn').onclick = ()=>{
+        stormBurst = 1.8; setTimeout(()=>stormBurst=0,600);
+        for(let i=0;i<8;i++){ const t=new Tri(); t.x=random(width*.25,width*.75); t.y=random(height*.25,height*.75);
+          t.vx=random(-2.2,2.2); t.vy=random(-1.6,1.6); t.size=random(14,30); triangles.push(t); }
+      };
+      document.getElementById('saveBtn').onclick = ()=>{
+        const merged = createGraphics(width, height);
+        merged.background(20);
+        drawWorld(merged, 0);
+        merged.image(pg,0,0);
+        saveCanvas(merged, 'headmosh_triangle_storm', 'png');
+        merged.remove();
+        toast();
+      };
+
+      // Pointer drawing (spawn fewer)
+      window.addEventListener('pointerdown', e=>{ isDrawing=true; lastPx=lastPy=null; drawPoint(e,true); });
+      window.addEventListener('pointermove', e=>{ if(isDrawing) drawPoint(e,false); });
+      window.addEventListener('pointerup',   ()=>{ isDrawing=false; lastPx=lastPy=null; });
+      window.addEventListener('pointercancel',()=>{ isDrawing=false; lastPx=lastPy=null; });
+
+      // Hotkeys
+      window.addEventListener('keydown', (ev)=>{
+        if (ev.key==='m' || ev.key==='M') toggleAudio();
+        if (ev.key==='k' || ev.key==='K') bumpSensitivity(+0.1);
+        if (ev.key==='j' || ev.key==='J') bumpSensitivity(-0.1);
+        if (ev.key==='t' || ev.key==='T') turbo();
+        if (ev.key==='n' || ev.key==='N') { paletteIndex=(paletteIndex+1)%palettes.length; }
+        if (ev.key==='b' || ev.key==='B') bloom = !bloom;
+      });
+
+      // Link badge text/href
+      const coinURL = "https://pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump";
+      document.getElementById('coinText').textContent = coinURL.replace(/^https?:\/\//,'');
+      document.getElementById('coinUrl').href = coinURL;
+
+      listMics();
+      navigator.mediaDevices?.addEventListener?.('devicechange', listMics);
+    }
+
+    function windowResized(){
+      resizeCanvas(windowWidth, windowHeight);
+      const old=pg; pg=createGraphics(windowWidth, windowHeight);
+      pg.clear(); pg.image(old,0,0); pg.stroke(240); pg.strokeWeight(2); pg.noFill();
+      old.remove();
+    }
+
+    function drawPoint(e, first){
+      const rect = document.querySelector('canvas').getBoundingClientRect();
+      const x = e.clientX - rect.left, y = e.clientY - rect.top;
+      if (lastPx==null || first) pg.point(x,y); else pg.line(lastPx,lastPy,x,y);
+      // spawn FEWER triangles along stroke
+      const t = new Tri();
+      t.x = x + random(-6,6);
+      t.y = y + random(-6,6);
+      t.vx = random(-1,1);
+      t.vy = random(-0.8,0.8);
+      t.size = random(12,24);
+      triangles.push(t);
+      lastPx = x; lastPy = y;
+    }
+
+    function draw(){
+      background(10);
+
+      // Audio → energy
+      const sens = Number(document.getElementById('sens').value);
+      const raw  = getLevel();
+      const lvl  = lerp(lastLevel, raw, 0.5); lastLevel = lvl;
+      // optional bass (makes bursts feel musical)
+      const bass = getBassEnergy();
+      let energy = Math.min(1.2, lvl * sens * 4);
+      if (bass > 0.35) energy = Math.min(1.4, energy + (bass-0.35)*0.8);
+
+      document.getElementById('ampLevel').textContent = `level: ${lvl.toFixed(2)}`;
+      // meter bar
+      const meter = document.querySelector('#meter > i');
+      if (meter){ meter.style.width = Math.min(100, Math.round(energy*100)) + '%'; }
+
+      // Clap/bass trigger
+      if ((lvl > PEAK && lastPeakLevel <= PEAK) || bass > 0.55) {
+        stormBurst = 1.4; setTimeout(() => stormBurst = 0, 220);
+        for (let i = 0; i < 6; i++) {
+          const t = new Tri();
+          t.x = random(width * 0.35, width * 0.65);
+          t.y = random(height * 0.35, height * 0.65);
+          t.vx = random(-2, 2);
+          t.vy = random(-1.6, 1.6);
+          t.size = random(12, 28);
+          triangles.push(t);
+        }
+      }
+      lastPeakLevel = lvl;
+
+      // World + ink
+      drawWorld(this, energy);
+      image(pg,0,0);
+
+      // Bloom-ish pop: simple screen passes
+      if (bloom){
+        push();
+        drawingContext.globalCompositeOperation = 'screen';
+        image(pg, 0, 0); // reuse ink as a light pass
+        pop();
+      }
+
+      // Vignette
+      noFill(); stroke(255,18); strokeWeight(80);
+      rect(width*.5,height*.5,width*.96,height*.96,30);
+    }
+
+    function drawWorld(g, energy){
+      // soft clouds, slightly reactive
+      g.push();
+      for(let i=0;i<5;i++){
+        const y=(sin((frameCount*0.002+i)*1.3)*0.5+0.5)*height;
+        g.noStroke(); g.fill(255, 8 + Math.min(40, energy*50));
+        g.ellipse((i/5)*width*1.1, y, width*0.9, 200);
+      }
+      g.pop();
+      // triangles
+      for(const t of triangles){ t.step(energy); t.draw(g); }
+      // tiny platform glow
+      g.push(); g.noStroke(); g.fill(255,14); g.ellipse(width/2,height*.82,360,60); g.fill(255); g.ellipse(width/2,height*.82-8,6,6); g.pop();
+    }
+
+    function bumpSensitivity(delta){
+      const el = document.getElementById('sens');
+      let v = Number(el.value);
+      v = Math.min(20, Math.max(1, v + (delta>0 ? 1 : -1)));
+      el.value = String(v);
+    }
+    function turbo(){
+      const el = document.getElementById('sens'); const old = Number(el.value);
+      el.value = String(Math.min(20, old + 5));
+      setTimeout(()=>{ el.value = String(old); }, 1200);
+    }
+    function toast(){
+      const t=document.getElementById('saveToast'); t.style.display='block'; setTimeout(()=>t.style.display='none',1200);
+    }
+  </script>
+</body>
+</html>
