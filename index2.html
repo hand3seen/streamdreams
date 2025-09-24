@@ -44,7 +44,7 @@
   <!-- Neon link badge -->
   <a id="coinUrl" class="pump-link" target="_blank" rel="noreferrer">
     <span class="pump-dot"></span>
-    <span id="coinText">pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump</span>
+    <span id="coinText">headmosh</span>
   </a>
   <div id="mic-hint">Hotkeys: <b>M</b> audio • <b>C</b> chill • <b>G</b> game • <b>K/J</b> sens • <b>N</b> palette • <b>B</b> bloom</div>
   <div id="meter"><i></i></div>
@@ -297,7 +297,7 @@
       // Clap/bass trigger (disabled in CHILL)
       if (!CHILL && ((lvl > PEAK && lastPeakLevel <= PEAK) || bass > 0.55)) {
         stormBurst = 1.2; setTimeout(() => stormBurst = 0, 220);
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 2; i++) {
           const t = new Tri();
           t.x = random(width * 0.35, width * 0.65);
           t.y = random(height * 0.35, height * 0.65);
